@@ -9,6 +9,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import argparse
+import csv
 import json
 import numpy as np
 from pathlib import Path
@@ -61,6 +62,7 @@ def detections_to_horizontal_bboxes(detections, temporal_id_start=0):
             "temporal_id": tid,
             "real_id": tid,
             "x": round(x_tl, 2), "y": round(y_tl, 2), "w": round(w_h, 2), "h": round(h_h, 2),
+            "cx": round(x, 2), "cy": round(y, 2), "w_rot": round(w, 2), "h_rot": round(h, 2), "angle": round(a, 2),
             "score": round(conf, 4),
         })
         tid += 1
@@ -109,24 +111,40 @@ def run_detection_on_folder(detector, folder_path, input_size=1024, conf_thres=0
             yield name, None
 
 
-def render_horizontal_bboxes(image_path, bboxes, output_path, color=(0, 255, 0), thickness=2, id_key="temporal_id"):
+def _draw_rotated_bbox(img, cx, cy, w_rot, h_rot, angle_deg, color=(255, 0, 0), thickness=2):
+    """Draw a rotated bbox (center cx,cy; size w_rot,h_rot; angle in degrees)."""
+    c = np.cos(np.deg2rad(angle_deg))
+    s = np.sin(np.deg2rad(angle_deg))
+    R = np.array([[c, s], [-s, c]])
+    half = np.array([[-w_rot/2, -h_rot/2], [w_rot/2, -h_rot/2], [w_rot/2, h_rot/2], [-w_rot/2, h_rot/2]])
+    pts = (half @ R.T + np.array([cx, cy])).astype(np.int32)
+    cv2.polylines(img, [pts], isClosed=True, color=color, thickness=thickness, lineType=cv2.LINE_4)
+
+
+def render_horizontal_bboxes(image_path, bboxes, output_path, color=(0, 255, 0), thickness=2, id_key="temporal_id", draw_rotated=True, rotated_color=(255, 0, 0)):
     """
     Draw horizontal bboxes on image with id labels and save to output_path.
-    image_path: path to original image (read as RGB for consistency).
-    bboxes: list of {"x", "y", "w", "h", ...} with id_key (temporal_id or real_id).
-    id_key: key to use for the label text ("temporal_id" or "real_id").
+    If draw_rotated and bboxes have cx/cy/w_rot/h_rot/angle, also draw the original tilted bbox.
     """
     img = np.array(Image.open(image_path).convert("RGB"))
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = max(0.5, img.shape[0] / 800)
     font_thick = max(1, int(img.shape[0] / 400))
     for b in bboxes:
+        if draw_rotated and "cx" in b and "angle" in b:
+            _draw_rotated_bbox(img, float(b["cx"]), float(b["cy"]), float(b["w_rot"]), float(b["h_rot"]), float(b["angle"]), color=rotated_color, thickness=thickness)
         x, y, w, h = int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
         cv2.rectangle(img, (x, y), (x + w, y + h), color, thickness)
         label = str(b.get(id_key, b.get("temporal_id", b.get("real_id", ""))))
         (tw, th), _ = cv2.getTextSize(label, font, font_scale, font_thick)
-        cv2.rectangle(img, (x, y - th - 4), (x + tw + 4, y), color, -1)
-        cv2.putText(img, label, (x + 2, y - 2), font, font_scale, (255, 255, 255), font_thick, cv2.LINE_AA)
+        # Place label inside bbox (top-left) so it stays visible when bbox is near image edge
+        pad = 2
+        lbl_x1 = max(0, x)
+        lbl_y1 = max(0, y)
+        lbl_x2 = min(img.shape[1], x + tw + 2 * pad)
+        lbl_y2 = min(img.shape[0], y + th + 2 * pad)
+        cv2.rectangle(img, (lbl_x1, lbl_y1), (lbl_x2, lbl_y2), color, -1)
+        cv2.putText(img, label, (x + pad, y + th + pad), font, font_scale, (255, 255, 255), font_thick, cv2.LINE_AA)
     img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     cv2.imwrite(str(output_path), img_bgr)
 
@@ -138,12 +156,13 @@ def main():
     parser = argparse.ArgumentParser(description="Batch detect and save horizontal bboxes per subfolder.")
     parser.add_argument("root_folder", type=str, help="Root folder containing one subfolder per sequence.")
     parser.add_argument("--render", action="store_true", help="Render horizontal bboxes on images and save in subfolder.")
-    parser.add_argument("--input-size", type=int, default=1024)
-    parser.add_argument("--conf-thres", type=float, default=0.3)
+    parser.add_argument("--input-size", type=int, default=1600)
+    parser.add_argument("--conf-thres", type=float, default=0.1)
     parser.add_argument("--weights", type=str, default="./weights/pL1_MWHB1024_Mar11_4000.ckpt")
     parser.add_argument("--no-cuda", action="store_true", help="Use CPU.")
     parser.add_argument("--output-json", type=str, default="detections.json", help="JSON filename inside each subfolder.")
     parser.add_argument("--id-mapping-json", type=str, default="id_mapping.json", help="Dummy JSON with files and temporal_id->real_id mapping.")
+    parser.add_argument("--id-mapping-csv", type=str, default="id_mapping.csv", help="CSV with file_name, temporal_id, real_id per subfolder.")
     args = parser.parse_args()
 
     root = Path(args.root_folder)
@@ -167,8 +186,7 @@ def main():
     for subfolder in subfolders:
         print(f"\nProcessing: {subfolder.name}")
         images_data = []
-        id_mapping_list = []  # [{"temporal_id": int, "real_id": int}, ...]
-        next_temporal_id = 0
+        id_mapping_list = []  # [{"file": str, "temporal_id": int, "real_id": int}, ...]; temporal_id per segment (0,1,2,... per file)
         file_names = []
         render_dir = subfolder / "rendered" if args.render else None
         if render_dir is not None:
@@ -179,12 +197,11 @@ def main():
         ):
             if detections is None:
                 bboxes_h = []
-                next_tid = next_temporal_id
             else:
-                bboxes_h, next_tid = detections_to_horizontal_bboxes(detections, temporal_id_start=next_temporal_id)
+                bboxes_h, _ = detections_to_horizontal_bboxes(detections, temporal_id_start=0)
 
             for b in bboxes_h:
-                id_mapping_list.append({"temporal_id": b["temporal_id"], "real_id": b["temporal_id"]})
+                id_mapping_list.append({"file": img_name, "temporal_id": b["temporal_id"], "real_id": b["real_id"]})
 
             images_data.append({
                 "image": img_name,
@@ -199,8 +216,6 @@ def main():
                 out_path = render_dir / out_name
                 render_horizontal_bboxes(subfolder / img_name, bboxes_h, out_path, id_key="temporal_id")
 
-            next_temporal_id = next_tid
-
         json_path = subfolder / args.output_json
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump({"images": images_data}, f, indent=2, ensure_ascii=False)
@@ -211,6 +226,14 @@ def main():
         with open(id_mapping_path, "w", encoding="utf-8") as f:
             json.dump(id_mapping_data, f, indent=2, ensure_ascii=False)
         print(f"  Wrote {id_mapping_path} ({len(id_mapping_list)} ids)")
+
+        csv_path = subfolder / args.id_mapping_csv
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["file_name", "temporal_id", "real_id"])
+            writer.writeheader()
+            for row in id_mapping_list:
+                writer.writerow({"file_name": row["file"], "temporal_id": row["temporal_id"], "real_id": row["real_id"]})
+        print(f"  Wrote {csv_path} ({len(id_mapping_list)} rows)")
 
     print("\nDone.")
 

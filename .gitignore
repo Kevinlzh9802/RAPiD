@@ -1,5 +1,6 @@
 script.py
 script_*
+experiments/
 
 logs/
 results/

@@ -1,6 +1,7 @@
 script.py
 script_*
 experiments/
+*.ipynb
 
 logs/
 results/
